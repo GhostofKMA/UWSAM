@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Dict, Optional, Tuple, Any
 import numpy as np
-
+import einops
 from detectron2.config import CfgNode
 from detectron2.layers import ShapeSpec
 from detectron2.modeling.proposal_generator import RPN, StandardRPNHead
@@ -90,22 +90,60 @@ class MultiScaleGenerator(nn.Module):
         return {"p2": p2, "p3": p3, "p4": p4}
 
 class PromptEncoder(nn.Module):
-    def __init__(self, in_channels, pooler_resolution, embed_dim=256):
+    def __init__(self, in_channels, pooler_resolution, embed_dim=256, num_points=5):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
-        self.flatten_dim = in_channels * pooler_resolution * pooler_resolution
-        self.mlp = nn.Sequential(
-            nn.Linear(self.flatten_dim, 1024),
-            nn.ReLU(inplace=True),
-            nn.Linear(1024, embed_dim)
+        self.num_points = num_points
+        self.embed_dim = embed_dim
+        
+        # 1. Downsample feature giống code tham khảo
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True)
         )
-        nn.init.kaiming_normal_(self.conv.weight, mode="fan_out", nonlinearity="linear")
-        if self.conv.bias is not None: nn.init.constant_(self.conv.bias, 0)
+        
+        reduced_resolution = pooler_resolution // 2 
+        flatten_dim = in_channels * reduced_resolution * reduced_resolution
+        
+        # Output dim x2 để tách làm sin/cos (giả lập logic của code tham khảo)
+        output_dim = embed_dim * num_points * 2 
+        
+        self.mlp = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(flatten_dim, in_channels), 
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels, in_channels), 
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels, output_dim) 
+        )
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None: nn.init.constant_(m.bias, 0)
+
     def forward(self, x):
+        # x: [B, C, H, W]
         x = self.conv(x)
-        x = x.flatten(start_dim=1)
-        x = self.mlp(x)
-        return x
+        
+        # Generate raw points: [B, num_points * embed_dim * 2]
+        points = self.mlp(x)
+        
+        # Reshape: [B, num_points, embed_dim * 2]
+        points = points.view(-1, self.num_points, self.embed_dim * 2)
+        
+        # --- SIN/COS TRICK (Giống Anchor.py) ---
+        # "Giả lập" Positional Encoding bằng cách trộn Sin và Feature
+        # Logic: sin(features[even]) + features[odd]
+        p_sin = torch.sin(points[..., 0::2]) 
+        p_other = points[..., 1::2]
+        
+        # [B, num_points, embed_dim] - Visual Embedding đã được hình học hóa
+        prompt_embeddings = p_sin + p_other
+        
+        return prompt_embeddings
 
 class ClassificationHead(nn.Module):
     def __init__(self, in_channels, pooler_resolution, num_classes):
@@ -126,7 +164,32 @@ class ClassificationHead(nn.Module):
         x = self.mlp(x)            
         return x
 
-# --- Class EUPG (Sửa lỗi Anchor Generator Size) ---
+class BoxRegressionHead(nn.Module):
+    def __init__(self, in_channels, pooler_resolution, box_dim=4):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.flatten_dim = in_channels * pooler_resolution * pooler_resolution
+        self.mlp = nn.Sequential(
+            nn.Linear(self.flatten_dim, 1024),
+            nn.ReLU(inplace=True),
+            nn.Linear(1024, 1024),
+            nn.ReLU(inplace=True),
+            nn.Linear(1024, box_dim) # Trả về 4 toạ độ (deltas)
+        )
+        # Init weights
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None: nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = x.flatten(start_dim=1)
+        x = self.mlp(x)
+        return x
+
 class EUPG(nn.Module):
     def __init__(self, cfg: CfgNode, input_shape: Dict[str, ShapeSpec]):
         super().__init__()
@@ -138,7 +201,6 @@ class EUPG(nn.Module):
         self.multiscale_gen = MultiScaleGenerator(out_channels=in_channels)
         self.pe_layer = PositionEmbeddingRandom(num_pos_feats=in_channels // 2)
         
-        # 3 Levels cho EUPG
         rpn_in_features = ["p2", "p3", "p4"]
         rpn_input_shapes = {
             "p2": ShapeSpec(channels=in_channels, stride=4),
@@ -147,14 +209,8 @@ class EUPG(nn.Module):
         }
         
         anchor_input_shapes = [rpn_input_shapes[f] for f in rpn_in_features]
-        # Định nghĩa size cho 3 level
-        anchor_sizes = [
-            [8, 16, 32],    
-            [32, 64, 128],  
-            [64, 128, 256]
-        ]
+        anchor_sizes = [[8, 16, 32], [32, 64, 128], [64, 128, 256]]
         
-        # 1. Tạo Generator thủ công (để dùng sau)
         self.anchor_generator = DefaultAnchorGenerator(
             cfg, 
             input_shape=anchor_input_shapes, 
@@ -168,29 +224,19 @@ class EUPG(nn.Module):
             box_dim=4
         )
         
-        # 2. Patch Config (FIX LỖI CRASH Ở ĐÂY)
         rpn_cfg = cfg.clone()
         rpn_cfg.defrost()
-        
-        # Sửa IN_FEATURES thành 3 cái
         rpn_cfg.MODEL.RPN.IN_FEATURES = rpn_in_features
-        
-        # [QUAN TRỌNG] Ghi đè SIZES thành list có 3 phần tử để khớp với len(IN_FEATURES)
-        # Nếu không sửa dòng này, nó sẽ lấy list 5 phần tử từ mask_rcnn gốc và gây lỗi assert
         rpn_cfg.MODEL.ANCHOR_GENERATOR.SIZES = anchor_sizes 
-        
-        # Đảm bảo ASPECT_RATIOS cũng đúng format (thường là list lồng nhau)
         rpn_cfg.MODEL.ANCHOR_GENERATOR.ASPECT_RATIOS = [[0.5, 1.0, 2.0]]
-        
         rpn_cfg.freeze()
         
-        # 3. Khởi tạo RPN với config đã patch
         self.rpn = RPN(
             rpn_cfg, 
             input_shape=rpn_input_shapes, 
             in_features=rpn_in_features, 
             head=self.rpn_head,
-            anchor_generator=self.anchor_generator, # Ghi đè generator
+            anchor_generator=self.anchor_generator,
             anchor_matcher=Matcher(
                 cfg.MODEL.RPN.IOU_THRESHOLDS, cfg.MODEL.RPN.IOU_LABELS, allow_low_quality_matches=True
             ),
@@ -210,9 +256,11 @@ class EUPG(nn.Module):
             pooler_type="ROIAlignV2",
         )
         
+        # [UPDATE] Sử dụng PromptEncoder mới (5 điểm, Sin/Cos)
         self.prompt_head = PromptEncoder(
             in_channels=in_channels, 
-            pooler_resolution=self.pooler_resolution
+            pooler_resolution=self.pooler_resolution,
+            num_points=5 
         )
         
         num_classes = cfg.MODEL.ROI_HEADS.NUM_CLASSES
@@ -221,27 +269,60 @@ class EUPG(nn.Module):
             pooler_resolution=self.pooler_resolution,
             num_classes=num_classes
         )
+        self.box_head = BoxRegressionHead(
+            in_channels=in_channels, pooler_resolution=self.pooler_resolution
+        )
 
     def forward(self, images: ImageList, features: Dict[str, torch.Tensor], gt_instances: List[Instances] = None):
         feat = features[self.in_feature_name]
         feat_attended = self.channel_attention(feat)
         multiscale_features = self.multiscale_gen(feat_attended)
         
+        # 1. RPN sinh Proposals
         proposals, losses = self.rpn(images, multiscale_features, gt_instances)
         
+        # 2. [FIX] TRỘN GT VÀO PROPOSALS
+        if self.training and gt_instances is not None:
+            proposals_with_gt = []
+            for p, gt in zip(proposals, gt_instances):
+                # Tạo Instances giả lập từ GT
+                gt_as_prop = Instances(p.image_size)
+                gt_as_prop.proposal_boxes = gt.gt_boxes
+                
+                # --- [SỬA LỖI TẠI ĐÂY] ---
+                # Thay vì dùng p.device (gây lỗi), ta lấy device từ box hoặc features
+                # Cách 1: Lấy từ feature map (chắc chắn đúng device)
+                device = feat.device 
+                
+                # Hoặc Cách 2: Lấy từ proposal boxes
+                # device = p.proposal_boxes.device
+                
+                # Gán điểm số cao tuyệt đối cho GT
+                gt_as_prop.objectness_logits = torch.ones(len(gt), device=device) * 10.0 
+                # -------------------------
+                
+                # Nối: [RPN Proposals, GT Boxes]
+                merged_prop = Instances.cat([p, gt_as_prop])
+                proposals_with_gt.append(merged_prop)
+            
+            proposals = proposals_with_gt
+            
+        # 3. Lấy Box từ danh sách đã trộn
         proposal_boxes = [p.proposal_boxes for p in proposals]
         
         features_with_pe = []
         feature_levels = ["p2", "p3", "p4"]
-        
         for level in feature_levels:
             f_img = multiscale_features[level]
             f_pe = self.pe_layer(f_img)
             features_with_pe.append(f_img + f_pe)
             
+        # 4. RoI Align
         roi_features = self.pooler(features_with_pe, proposal_boxes)
         
-        prompt_embeddings = self.prompt_head(roi_features).unsqueeze(1)
+        # 5. Heads
+        prompt_embeddings = self.prompt_head(roi_features) 
         pred_class_logits = self.cls_head(roi_features)
+        pred_proposal_deltas = self.box_head(roi_features)
 
-        return proposals, losses, prompt_embeddings, pred_class_logits
+        return proposals, losses, prompt_embeddings, pred_class_logits, pred_proposal_deltas

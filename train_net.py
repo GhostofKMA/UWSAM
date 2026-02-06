@@ -20,14 +20,14 @@ from core import backbone, uwsam
 def add_uwsam_config(cfg):
     cfg.MODEL.SAM = CN()
     # --- [Config ViT-B như yêu cầu] ---
-    cfg.MODEL.SAM.TYPE = "vit_b"
+    cfg.MODEL.SAM.TYPE = "vit_h"
     # Đường dẫn weight SAM gốc (cần đảm bảo file này tồn tại)
-    cfg.MODEL.SAM.CHECKPOINT = "weights/sam_vit_b_01ec64.pth" 
+    cfg.MODEL.SAM.CHECKPOINT = "/home/hoangnv/MaskRCNN-LoRA-/weights/sam_vit_h_4b8939.pth" 
     cfg.MODEL.SAM.IMAGE_SIZE = 1024
     cfg.MODEL.SAM.FREEZE = True
     cfg.MODEL.RPN.POST_NMS_TOPK_TRAIN = 2000 
     cfg.MODEL.RPN.PRE_NMS_TOPK_TRAIN = 2000
-    cfg.MODEL.ROI_HEADS.IOU_THRESHOLDS = [0.3] 
+    cfg.MODEL.ROI_HEADS.IOU_THRESHOLDS = [0.] 
     cfg.MODEL.ROI_HEADS.IOU_LABELS = [0, 1]
     cfg.MODEL.SAM.LORA = CN()
     cfg.MODEL.SAM.LORA.ENABLED = True
@@ -62,22 +62,14 @@ def setup(args):
     cfg.INPUT.CROP.ENABLED = False # Tắt crop mặc định vì ta dùng FixedSizeCrop trong mapper
     
     cfg.MODEL.DEVICE = "cuda"
-    
-    # --- [Đường dẫn dữ liệu] ---
-    # Cậu kiểm tra lại đường dẫn này trên máy server nhé
-    DATA_ROOT = "/home/hoangnv/MaskRCNN+EfficientSAM/data/UIIS10K/"
+    DATA_ROOT = "/data/bailab_data/hoangnv/UIIS10K/"
     register_coco_instances("uiis10k_train", {}, os.path.join(DATA_ROOT, "annotations/multiclass_train.json"), os.path.join(DATA_ROOT, "img"))
     register_coco_instances("uiis10k_test", {}, os.path.join(DATA_ROOT, "annotations/multiclass_test.json"), os.path.join(DATA_ROOT, "img"))
     
     cfg.DATASETS.TRAIN = ("uiis10k_train",)
     cfg.DATASETS.TEST = ("uiis10k_test",)
     cfg.DATALOADER.NUM_WORKERS = 4 # Tăng lên 4 nếu CPU khỏe để load ảnh nhanh hơn
-    
-    # --- [CẤU HÌNH SOLVER CHUẨN] ---
-    # Batch Size thật = IMS_PER_BATCH (Trên tất cả GPU)
-    # Thử để 4. Nếu OOM thì giảm xuống 2.
-    cfg.SOLVER.IMS_PER_BATCH = 2
-    cfg.ACUMULATE_STEPS = 2  # Giả sử ta muốn batch size thật là 4 trên 2 GPU, thì mỗi GPU xử lý 2 ảnh, tích trữ gradient 2 bước nữa mới cập nhật.
+    cfg.SOLVER.IMS_PER_BATCH = 4
     cfg.SOLVER.BASE_LR = 0.0002
     cfg.SOLVER.WEIGHT_DECAY = 0.05
     cfg.SOLVER.WARMUP_ITERS = 1000 # Giảm warmup xuống chút vì dataset cũng ko quá lớn
@@ -97,8 +89,6 @@ def setup(args):
     cfg.SOLVER.STEPS = (one_epoch_iters * 15, one_epoch_iters * 20)
     cfg.SOLVER.CHECKPOINT_PERIOD = one_epoch_iters 
     cfg.TEST.EVAL_PERIOD = one_epoch_iters *24
-    
-    # Bật AMP (Mixed Precision) để tiết kiệm VRAM cho SAM
     cfg.SOLVER.AMP.ENABLED = False
     
     # Gradient Clipping là cần thiết cho Transformer
@@ -107,7 +97,7 @@ def setup(args):
     cfg.SOLVER.CLIP_GRADIENTS.CLIP_VALUE = 1.0
     cfg.SOLVER.CLIP_GRADIENTS.NORM_TYPE = 2.0
     
-    cfg.OUTPUT_DIR = "./output/uwsam_vit_b_lora_standard_bs"
+    cfg.OUTPUT_DIR = "./output/uwsam_vit_h_lora_standard_bs"
     cfg.freeze()
     default_setup(cfg, args)
     return cfg
@@ -182,7 +172,7 @@ def main(args):
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\n{'='*40}")
-    print(f"[MODEL INFO] Architecture: UWSAM (ViT-B + LoRA)")
+    print(f"[MODEL INFO] Architecture: UWSAM ({cfg.MODEL.SAM.TYPE.upper()} + LoRA)")
     print(f"[MODEL INFO] Total Params:      {total_params / 1e6:.2f} M")
     print(f"[MODEL INFO] Trainable Params:  {trainable_params / 1e6:.2f} M")
     print(f"[MODEL INFO] Trainable Ratio:   {(trainable_params/total_params)*100:.2f} %")
