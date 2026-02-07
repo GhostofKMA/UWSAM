@@ -13,7 +13,7 @@ from detectron2.modeling.box_regression import Box2BoxTransform
 from detectron2.modeling.matcher import Matcher
 from detectron2.modeling.poolers import ROIPooler
 from detectron2.structures import ImageList, Instances
-
+from .utils import ColorAttentionAdapter, MultiScaleConv
 # --- Giữ nguyên các class phụ trợ (Không thay đổi) ---
 class PositionEmbeddingRandom(nn.Module):
     def __init__(self, num_pos_feats: int = 64, scale: Optional[float] = None) -> None:
@@ -204,29 +204,36 @@ class BoxRegressionHead(nn.Module):
 class EUPG(nn.Module):
     def __init__(self, cfg: CfgNode, input_shape: Dict[str, ShapeSpec]):
         super().__init__()
-        in_features = list(input_shape.keys()) 
+        # 1. Setup Input
+        in_features = list(input_shape.keys())
         self.in_feature_name = in_features[0]
         in_channels = input_shape[self.in_feature_name].channels
         
-        self.channel_attention = ChannelAttention(in_channels)
-        self.multiscale_gen = MultiScaleGenerator(out_channels=in_channels)
-        self.pe_layer = PositionEmbeddingRandom(num_pos_feats=in_channels // 2)
+        # 2. Modules xử lý Feature (Branching logic)
+        # Branch 1 (cho RoI) & Branch 2 (cho RPN) đều dùng chung feature đã qua attention
+        self.ca_adapter = ColorAttentionAdapter(in_channels, mlp_ratio=0.25)
         
+        # Module tạo Multi-scale feature cho RPN (giả lập FPN từ 1 feature map)
+        self.multiscale_gen = MultiScaleConv(in_channels, in_channels)
+        
+        # 3. Setup RPN (Standard Detectron2 RPN)
+        # Tạo giả các level p2, p3, p4 từ output của MultiScaleConv
         rpn_in_features = ["p2", "p3", "p4"]
+        # Stride giả lập
+        rpn_strides = [4, 8, 16] 
         rpn_input_shapes = {
-            "p2": ShapeSpec(channels=in_channels, stride=4),
-            "p3": ShapeSpec(channels=in_channels, stride=8),
-            "p4": ShapeSpec(channels=in_channels, stride=16),
+            f: ShapeSpec(channels=in_channels, stride=s) 
+            for f, s in zip(rpn_in_features, rpn_strides)
         }
         
-        anchor_input_shapes = [rpn_input_shapes[f] for f in rpn_in_features]
-        anchor_sizes = [[8, 16, 32], [32, 64, 128], [64, 128, 256]]
+        # Anchor sizes khớp với config anchor_net.py: scales=[4, 8], strides=[4,8,16,32,64]
+        # Nhưng ở đây ta simplifiy cho input single level
+        anchor_sizes = [[32], [64], [128]] 
+        aspect_ratios = [[0.5, 1.0, 2.0]] * len(rpn_in_features)
         
         self.anchor_generator = DefaultAnchorGenerator(
-            cfg, 
-            input_shape=anchor_input_shapes, 
-            sizes=anchor_sizes, 
-            aspect_ratios=[[0.5, 1.0, 2.0]] * len(rpn_in_features)
+            cfg, input_shape=list(rpn_input_shapes.values()), 
+            sizes=anchor_sizes, aspect_ratios=aspect_ratios
         )
         
         self.rpn_head = StandardRPNHead(
@@ -235,22 +242,19 @@ class EUPG(nn.Module):
             box_dim=4
         )
         
+        # Clone config để hack RPN nhận input shapes mới
         rpn_cfg = cfg.clone()
         rpn_cfg.defrost()
         rpn_cfg.MODEL.RPN.IN_FEATURES = rpn_in_features
-        rpn_cfg.MODEL.ANCHOR_GENERATOR.SIZES = anchor_sizes 
-        rpn_cfg.MODEL.ANCHOR_GENERATOR.ASPECT_RATIOS = [[0.5, 1.0, 2.0]]
         rpn_cfg.freeze()
         
         self.rpn = RPN(
             rpn_cfg, 
-            input_shape=rpn_input_shapes, 
-            in_features=rpn_in_features, 
+            input_shape=rpn_input_shapes,
+            in_features=rpn_in_features,
             head=self.rpn_head,
             anchor_generator=self.anchor_generator,
-            anchor_matcher=Matcher(
-                cfg.MODEL.RPN.IOU_THRESHOLDS, cfg.MODEL.RPN.IOU_LABELS, allow_low_quality_matches=True
-            ),
+            anchor_matcher=Matcher(cfg.MODEL.RPN.IOU_THRESHOLDS, cfg.MODEL.RPN.IOU_LABELS, allow_low_quality_matches=True),
             box2box_transform=Box2BoxTransform(weights=cfg.MODEL.RPN.BBOX_REG_WEIGHTS),
             batch_size_per_image=cfg.MODEL.RPN.BATCH_SIZE_PER_IMAGE,
             positive_fraction=cfg.MODEL.RPN.POSITIVE_FRACTION,
@@ -259,81 +263,23 @@ class EUPG(nn.Module):
             nms_thresh=cfg.MODEL.RPN.NMS_THRESH,
         )
 
-        self.pooler_resolution = 14
-        self.pooler = ROIPooler(
-            output_size=(self.pooler_resolution, self.pooler_resolution),
-            scales=[1.0 / rpn_input_shapes[k].stride for k in rpn_in_features],
-            sampling_ratio=0,
-            pooler_type="ROIAlignV2",
-        )
-        
-        # [UPDATE] Sử dụng PromptEncoder mới (5 điểm, Sin/Cos)
-        self.prompt_head = PromptEncoder(
-            in_channels=in_channels, 
-            pooler_resolution=self.pooler_resolution,
-            num_points=5 
-        )
-        
-        num_classes = cfg.MODEL.ROI_HEADS.NUM_CLASSES
-        self.cls_head = ClassificationHead(
-            in_channels=in_channels,
-            pooler_resolution=self.pooler_resolution,
-            num_classes=num_classes
-        )
-        self.box_head = BoxRegressionHead(
-            in_channels=in_channels, pooler_resolution=self.pooler_resolution
-        )
-
-    def forward(self, images: ImageList, features: Dict[str, torch.Tensor], gt_instances: List[Instances] = None):
+    def forward(self, images: ImageList, features: Dict[str, torch.Tensor], gt_instances=None):
+        # 1. Lấy Feature gốc (thường là stride 16 từ SAM)
         feat = features[self.in_feature_name]
-        feat_attended = self.channel_attention(feat)
-        multiscale_features = self.multiscale_gen(feat_attended)
         
-        # 1. RPN sinh Proposals
-        proposals, losses = self.rpn(images, multiscale_features, gt_instances)
+        # 2. Apply Color Attention (Common path)
+        feat_attended = self.ca_adapter(feat)
         
-        # 2. [FIX] TRỘN GT VÀO PROPOSALS
-        if self.training and gt_instances is not None:
-            proposals_with_gt = []
-            for p, gt in zip(proposals, gt_instances):
-                # Tạo Instances giả lập từ GT
-                gt_as_prop = Instances(p.image_size)
-                gt_as_prop.proposal_boxes = gt.gt_boxes
-                
-                # --- [SỬA LỖI TẠI ĐÂY] ---
-                # Thay vì dùng p.device (gây lỗi), ta lấy device từ box hoặc features
-                # Cách 1: Lấy từ feature map (chắc chắn đúng device)
-                device = feat.device 
-                
-                # Hoặc Cách 2: Lấy từ proposal boxes
-                # device = p.proposal_boxes.device
-                
-                # Gán điểm số cao tuyệt đối cho GT
-                gt_as_prop.objectness_logits = torch.ones(len(gt), device=device) * 10.0 
-                # -------------------------
-                
-                # Nối: [RPN Proposals, GT Boxes]
-                merged_prop = Instances.cat([p, gt_as_prop])
-                proposals_with_gt.append(merged_prop)
-            
-            proposals = proposals_with_gt
-            
-        # 3. Lấy Box từ danh sách đã trộn
-        proposal_boxes = [p.proposal_boxes for p in proposals]
+        # 3. Nhánh cho RPN (Branch 2): Multi-scale transformation
+        # Ở đây ta dùng trick: downsample feature gốc để tạo p3, p4
+        # p2 = feature gốc qua multiscale
+        p2 = self.multiscale_gen(feat_attended) 
+        p3 = nn.functional.max_pool2d(p2, kernel_size=2, stride=2)
+        p4 = nn.functional.max_pool2d(p3, kernel_size=2, stride=2)
         
-        features_with_pe = []
-        feature_levels = ["p2", "p3", "p4"]
-        for level in feature_levels:
-            f_img = multiscale_features[level]
-            f_pe = self.pe_layer(f_img)
-            features_with_pe.append(f_img + f_pe)
-            
-        # 4. RoI Align
-        roi_features = self.pooler(features_with_pe, proposal_boxes)
+        rpn_features = {"p2": p2, "p3": p3, "p4": p4}
         
-        # 5. Heads
-        prompt_embeddings = self.prompt_head(roi_features) 
-        pred_class_logits = self.cls_head(roi_features)
-        pred_proposal_deltas = self.box_head(roi_features)
-
-        return proposals, losses, prompt_embeddings, pred_class_logits, pred_proposal_deltas
+        # 4. Gọi RPN
+        proposals, losses = self.rpn(images, rpn_features, gt_instances)
+        
+        return proposals, losses, feat_attended
