@@ -169,20 +169,31 @@ class BoxRegressionHead(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
         self.flatten_dim = in_channels * pooler_resolution * pooler_resolution
+        
+        # [NEW] Tách layer để dễ init
+        self.fc1 = nn.Linear(self.flatten_dim, 1024)
+        self.fc2 = nn.Linear(1024, 1024)
+        self.output_layer = nn.Linear(1024, box_dim) 
+        
         self.mlp = nn.Sequential(
-            nn.Linear(self.flatten_dim, 1024),
+            self.fc1,
             nn.ReLU(inplace=True),
-            nn.Linear(1024, 1024),
+            self.fc2,
             nn.ReLU(inplace=True),
-            nn.Linear(1024, box_dim) # Trả về 4 toạ độ (deltas)
+            self.output_layer
         )
-        # Init weights
+        
+        # Init weights cơ bản
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
             elif isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
                 if m.bias is not None: nn.init.constant_(m.bias, 0)
+        
+        # [FIX QUAN TRỌNG] Init lớp cuối cùng cực nhỏ để Loss ban đầu ~ 0
+        nn.init.normal_(self.output_layer.weight, std=0.001)
+        nn.init.constant_(self.output_layer.bias, 0)
 
     def forward(self, x):
         x = self.conv(x)

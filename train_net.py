@@ -59,7 +59,7 @@ def setup(args):
     cfg.INPUT.MAX_SIZE_TRAIN = 1024
     cfg.INPUT.MIN_SIZE_TEST = 1024
     cfg.INPUT.MAX_SIZE_TEST = 1024
-    cfg.INPUT.CROP.ENABLED = False # Tắt crop mặc định vì ta dùng FixedSizeCrop trong mapper
+    cfg.INPUT.CROP.ENABLED = False 
     
     cfg.MODEL.DEVICE = "cuda"
     DATA_ROOT = "/data/bailab_data/hoangnv/UIIS10K/"
@@ -69,7 +69,8 @@ def setup(args):
     cfg.DATASETS.TRAIN = ("uiis10k_train",)
     cfg.DATASETS.TEST = ("uiis10k_test",)
     cfg.DATALOADER.NUM_WORKERS = 4 # Tăng lên 4 nếu CPU khỏe để load ảnh nhanh hơn
-    cfg.SOLVER.IMS_PER_BATCH = 4
+    cfg.SOLVER.IMS_PER_BATCH = 1
+    cfg.ACCUMULATE_STEPS = 4  # Giả lập batch size lớn hơn bằng cách tích lũy Gradients
     cfg.SOLVER.BASE_LR = 0.0002
     cfg.SOLVER.WEIGHT_DECAY = 0.05
     cfg.SOLVER.WARMUP_ITERS = 1000 # Giảm warmup xuống chút vì dataset cũng ko quá lớn
@@ -89,7 +90,7 @@ def setup(args):
     cfg.SOLVER.STEPS = (one_epoch_iters * 15, one_epoch_iters * 20)
     cfg.SOLVER.CHECKPOINT_PERIOD = one_epoch_iters 
     cfg.TEST.EVAL_PERIOD = one_epoch_iters *24
-    cfg.SOLVER.AMP.ENABLED = False
+    cfg.SOLVER.AMP.ENABLED = True
     
     # Gradient Clipping là cần thiết cho Transformer
     cfg.SOLVER.CLIP_GRADIENTS.ENABLED = True

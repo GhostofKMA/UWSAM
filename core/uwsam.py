@@ -133,7 +133,6 @@ class UWSAM(nn.Module):
         else:
             gt_instances = None
             
-        # Nhận thêm pred_proposal_deltas
         proposals, proposal_losses, all_visual_prompts, pred_class_logits, pred_proposal_deltas = self.proposal_generator(images, features, gt_instances)
         
         num_proposals_per_img = [len(p) for p in proposals]
@@ -143,13 +142,12 @@ class UWSAM(nn.Module):
 
         # ---------------- TRAINING ----------------
         if self.training:
-            # 1. Start with RPN losses (loss_rpn_cls, loss_rpn_loc)
             losses = {}
             losses.update(proposal_losses) 
             
             mask_loss_acc = torch.tensor(0., device=self.device)
             loss_cls_acc = torch.tensor(0., device=self.device)
-            loss_box_reg_acc = torch.tensor(0., device=self.device) # [NEW]
+            loss_box_reg_acc = torch.tensor(0., device=self.device)
             
             total_pos = 0
             total_samples = 0
@@ -157,144 +155,91 @@ class UWSAM(nn.Module):
             for i, (p_inst, visual_emb, p_logits, p_deltas, targets) in enumerate(zip(
                 proposals, visual_prompts_split, class_logits_split, deltas_split, gt_instances
             )):
-                if len(targets) == 0 or len(p_inst) == 0: continue
+                if len(targets) == 0: continue
 
-                # Matcher
+                # --- 1. Matcher & Force Positive (QUAN TRỌNG) ---
                 with torch.no_grad():
                     match_quality_matrix = pairwise_iou(p_inst.proposal_boxes, targets.gt_boxes)
                     matched_idxs, matched_labels = self.matcher(match_quality_matrix)
+                    
+                    # [FORCE MATCH] Gán nhãn Positive cho các GT đã được trộn vào cuối danh sách
+                    num_gt = len(targets)
+                    if num_gt > 0:
+                        safe_idx = min(len(matched_labels), num_gt)
+                        if safe_idx > 0:
+                            # Index của các GT nằm ở cuối danh sách proposals
+                            matched_labels[-safe_idx:] = 1
+                            # Map chúng với chính các target tương ứng (0, 1, ... num_gt-1)
+                            gt_indices_forced = torch.arange(num_gt, device=self.device)[-safe_idx:]
+                            matched_idxs[-safe_idx:] = gt_indices_forced
+
                     pos_inds = torch.nonzero(matched_labels == 1).squeeze(1)
 
-                # --- A. Loss CLS ---
+                # --- 2. Loss CLS (Safe Version) ---
+                # Fallback: Tự động thêm cột background nếu thiếu
                 if p_logits.shape[1] == self.num_classes:
-                    # Tạo cột background với giá trị rất thấp (xác suất ~ 0)
                     padding = torch.full((p_logits.shape[0], 1), -1e9, device=self.device)
                     p_logits = torch.cat([p_logits, padding], dim=1)
                 
-                # 2. Xác định Index của Background dựa trên shape thực tế
-                # Background luôn là cột cuối cùng
                 bg_class_ind = p_logits.shape[1] - 1 
+                gt_classes_target = torch.full((len(p_inst),), bg_class_ind, dtype=torch.long, device=self.device)
                 
-                # 3. Tạo Target
-                # Mặc định gán tất cả là Background
-                gt_classes_target = torch.full(
-                    (len(p_inst),), bg_class_ind, dtype=torch.long, device=self.device
-                )
-                
-                # [CRITICAL FIX] Only process valid positive matches
                 if len(pos_inds) > 0:
-                    # Move to CPU to safely access indices
-                    pos_inds_cpu = pos_inds.cpu().numpy()
-                    matched_idxs_cpu = matched_idxs.cpu().numpy()
-                    
-                    # Get target GT indices for positive proposals
-                    gt_idxs_for_pos = matched_idxs_cpu[pos_inds_cpu]
-                    
-                    # Filter only valid GT indices (>= 0, < num_targets)
-                    valid_mask = (gt_idxs_for_pos >= 0) & (gt_idxs_for_pos < len(targets))
-                    valid_pos_inds = pos_inds[torch.tensor(valid_mask, device=self.device)]
-                    valid_gt_idxs = gt_idxs_for_pos[valid_mask]
-                    
-                    if len(valid_pos_inds) > 0:
-                        # Safely index targets on CPU, then move back
-                        target_labels_list = []
-                        for gt_idx in valid_gt_idxs:
-                            target_labels_list.append(targets.gt_classes[int(gt_idx)])
-                        target_labels = torch.stack(target_labels_list).to(self.device)
-                        
-                        # Check max value on CPU
-                        max_label = int(target_labels.max().item()) if target_labels.numel() > 0 else 0
-                        
-                        # Convert 1-indexed COCO to 0-indexed if needed
-                        if max_label > self.num_classes - 1:
-                            target_labels = target_labels - 1
-                        
-                        # Clamp to valid range
-                        target_labels = torch.clamp(target_labels, min=0, max=bg_class_ind - 1)
-                        
-                        # Assign to valid positions
-                        gt_classes_target[valid_pos_inds] = target_labels
+                    gt_idx_mapped = matched_idxs[pos_inds]
+                    target_labels = targets.gt_classes[gt_idx_mapped]
+                    # Kẹp nhãn để không bao giờ vượt quá background
+                    target_labels = torch.clamp(target_labels, min=0, max=bg_class_ind - 1)
+                    gt_classes_target[pos_inds] = target_labels
 
-                # 4. Tính Loss
-                # Lúc này: max(target) == bg_class_ind == (p_logits.shape[1] - 1)
-                # Đảm bảo index luôn hợp lệ -> KHÔNG BAO GIỜ LỖI CUDA
-                # [CRITICAL FIX] Clamp gt_classes_target để chắc chắn không vượt quá số classes
-                gt_classes_target = torch.clamp(gt_classes_target, min=0, max=p_logits.shape[1] - 1)
                 loss_cls_img = self.loss_cls(p_logits, gt_classes_target)
-                
                 loss_cls_acc += loss_cls_img
                 total_samples += 1
 
-                # --- B. Loss Box Reg (Stage 2) ---
-                # Chỉ tính cho Positive samples
+                # --- 3. Loss Box Reg ---
                 if len(pos_inds) > 0:
-                    # [CRITICAL] Use CPU-safe indexing
-                    pos_inds_cpu = pos_inds.cpu().numpy()
-                    matched_idxs_cpu = matched_idxs.cpu().numpy()
-                    gt_inds_all = matched_idxs_cpu[pos_inds_cpu]
+                    gt_inds = matched_idxs[pos_inds]
                     
-                    # Filter valid GT indices
-                    valid_gt_mask = (gt_inds_all >= 0) & (gt_inds_all < len(targets))
-                    if valid_gt_mask.any():
-                        valid_pos_inds = pos_inds[torch.tensor(valid_gt_mask, device=self.device)]
-                        valid_gt_inds = gt_inds_all[valid_gt_mask]
-                        
-                        # Safely index targets using CPU indices
-                        gt_boxes_list = [targets.gt_boxes[int(idx)] for idx in valid_gt_inds]
-                        gt_boxes = type(targets.gt_boxes)(torch.stack([b.tensor for b in gt_boxes_list]))
-                        
-                        # Lấy proposal boxes tương ứng
-                        src_boxes = p_inst.proposal_boxes[valid_pos_inds]
-                        
-                        # Tính GT Deltas chuẩn
-                        gt_deltas = self.box2box_transform.get_deltas(src_boxes.tensor, gt_boxes.tensor)
-                        pred_deltas_pos = p_deltas[valid_pos_inds]
-                        
-                        # Smooth L1 Loss
-                        loss_box_reg_img = smooth_l1_loss(
-                            pred_deltas_pos, gt_deltas, beta=0.0, reduction="sum"
-                        )
-                        # Normalize by number of positive samples
-                        loss_box_reg_acc += loss_box_reg_img / max(len(valid_pos_inds), 1.0)
+                    # Lấy GT Box và Proposal Box tương ứng
+                    # [DIRECT INDEXING] Detectron2 hỗ trợ indexing trực tiếp, không cần loop CPU
+                    gt_boxes = targets.gt_boxes[gt_inds]
+                    src_boxes = p_inst.proposal_boxes[pos_inds]
+                    
+                    # Tính GT Deltas
+                    gt_deltas = self.box2box_transform.get_deltas(src_boxes.tensor, gt_boxes.tensor)
+                    pred_deltas_pos = p_deltas[pos_inds]
+                    
+                    loss_box_reg_img = smooth_l1_loss(pred_deltas_pos, gt_deltas, beta=0.0, reduction="sum")
+                    loss_box_reg_acc += loss_box_reg_img / max(len(pos_inds), 1.0)
 
-                # --- C. Loss Mask ---
+                # --- 4. Loss Mask ---
                 if len(pos_inds) == 0: continue
                 
-                # [CRITICAL] Filter to only valid GT indices on CPU
-                pos_inds_cpu = pos_inds.cpu().numpy()
-                matched_idxs_cpu = matched_idxs.cpu().numpy()
-                gt_inds_all_cpu = matched_idxs_cpu[pos_inds_cpu]
-                valid_mask = (gt_inds_all_cpu >= 0) & (gt_inds_all_cpu < len(targets))
+                # Sampling đơn giản để tránh OOM
+                if len(pos_inds) > 64:
+                    perm = torch.randperm(len(pos_inds))[:64]
+                    pos_inds = pos_inds[perm]
                 
-                if not valid_mask.any():
-                    continue
+                # Cập nhật lại gt_inds theo pos_inds đã sample
+                gt_inds = matched_idxs[pos_inds]
                 
-                valid_pos_inds_mask = pos_inds[torch.tensor(valid_mask, device=self.device)]
-                gt_inds_safe = gt_inds_all_cpu[valid_mask]
-                
-                if len(valid_pos_inds_mask) > 32:
-                    perm = torch.randperm(len(valid_pos_inds_mask))[:32]
-                    valid_pos_inds_mask = valid_pos_inds_mask[perm]
-                    gt_inds_safe = gt_inds_safe[perm]
-                
-                # ... (Logic tạo prompt giữ nguyên) ...
-                rpn_boxes_pos = p_inst.proposal_boxes[valid_pos_inds_mask].tensor
+                # Create Hybrid Prompt
+                rpn_boxes_pos = p_inst.proposal_boxes[pos_inds].tensor
                 with torch.no_grad():
                     box_embeddings = self.prompt_encoder(points=None, boxes=rpn_boxes_pos, masks=None)[0] 
-                visual_embeddings_pos = visual_emb[valid_pos_inds_mask] 
+                visual_embeddings_pos = visual_emb[pos_inds] 
                 sparse_embeddings = torch.cat([box_embeddings, visual_embeddings_pos], dim=1)
                 
                 with torch.no_grad():
                     _, dense_embeddings = self.prompt_encoder(points=None, boxes=None, masks=None)
-                dense_embeddings = dense_embeddings.repeat(len(valid_pos_inds_mask), 1, 1, 1)
+                dense_embeddings = dense_embeddings.repeat(len(pos_inds), 1, 1, 1)
 
                 curr_emb = image_embeddings[i]
                 while curr_emb.dim() > 3: curr_emb = curr_emb.squeeze(0)
                 curr_emb = curr_emb.unsqueeze(0)
                 curr_pe = self.pe_layer(curr_emb)
 
-                # GT Mask - use CPU indices
-                gt_masks_orig = targets.gt_masks[[int(idx) for idx in gt_inds_safe]]
+                # Get GT Masks [DIRECT INDEXING]
+                gt_masks_orig = targets.gt_masks[gt_inds]
                 if isinstance(gt_masks_orig, PolygonMasks):
                     h_img, w_img = targets.image_size
                     bitmasks = BitMasks.from_polygon_masks(gt_masks_orig.polygons, h_img, w_img)
@@ -302,7 +247,6 @@ class UWSAM(nn.Module):
                 else:
                     gt_masks_tensor = gt_masks_orig.tensor.float().to(self.device)
 
-                # SAM Decoder
                 low_res_masks, iou_preds = self.mask_decoder(
                     image_embeddings=curr_emb, image_pe=curr_pe,
                     sparse_prompt_embeddings=sparse_embeddings, dense_prompt_embeddings=dense_embeddings,
@@ -313,16 +257,14 @@ class UWSAM(nn.Module):
                     low_res_masks, size=(1024, 1024), mode="bilinear", align_corners=False
                 ).squeeze(1)
                 
-                # Tính Loss Mask gộp
                 loss_dict = self.criterion(pred_masks_up, gt_masks_tensor, iou_preds.flatten())
-                mask_loss_acc += loss_dict["loss_mask"] * len(valid_pos_inds_mask)
-                
-                total_pos += len(valid_pos_inds_mask)
+                mask_loss_acc += loss_dict["loss_mask"] * len(pos_inds)
+                total_pos += len(pos_inds)
 
-            # Normalize and Update Dict
+            # Normalize losses
             if total_samples > 0:
                 losses["loss_cls"] = loss_cls_acc / total_samples
-                losses["loss_box_reg"] = loss_box_reg_acc / total_samples # Có loss box reg
+                losses["loss_box_reg"] = loss_box_reg_acc / total_samples
             else:
                 losses["loss_cls"] = torch.tensor(0., device=self.device, requires_grad=True)
                 losses["loss_box_reg"] = torch.tensor(0., device=self.device, requires_grad=True)
@@ -330,40 +272,82 @@ class UWSAM(nn.Module):
             if total_pos > 0:
                 losses["loss_mask"] = mask_loss_acc / total_pos
             else:
-                losses["loss_mask"] = torch.tensor(0., device=self.device, requires_grad=True)
+                dummy_loss = 0.0
+                # Cộng các tham số của mask_decoder
+                for p in self.mask_decoder.parameters():
+                    dummy_loss += p.sum()
+                # Cộng các tham số của prompt_encoder (nếu có train)
+                for p in self.prompt_encoder.parameters():
+                    dummy_loss += p.sum()
+                    
+                # Nhân với 0 để không ảnh hưởng kết quả, nhưng có Gradient
+                losses["loss_mask"] = dummy_loss * 0.0
 
             return losses
-
-        # ---------------- INFERENCE ----------------
+            
+        # ... (Phần inference giữ nguyên) ...
         else:
             final_results = []
             for i, (p_inst, p_logits, p_deltas, visual_emb) in enumerate(zip(proposals, class_logits_split, deltas_split, visual_prompts_split)):
                 if len(p_inst) == 0: final_results.append(p_inst); continue
                 
-                # Apply Box Refinement (Stage 2)
                 scores, classes = F.softmax(p_logits, dim=-1).max(dim=-1)
                 valid_mask = classes < self.num_classes
                 
-                # Refine boxes using predicted deltas
-                pred_boxes = self.box2box_transform.apply_deltas(
-                    p_deltas, p_inst.proposal_boxes.tensor
-                )
-                # Chỉ lấy box của class dự đoán
-                # (Đơn giản hoá: lấy box tương ứng class max score, hoặc dùng class-agnostic box)
-                # Ở đây mình dùng class-agnostic style (giống SAM) hoặc lấy đúng cột delta.
-                # EUPG BoxHead của mình trả về (N, 4) class agnostic
+                pred_boxes = self.box2box_transform.apply_deltas(p_deltas, p_inst.proposal_boxes.tensor)
                 refined_boxes = Boxes(pred_boxes)
+                p_inst.proposal_boxes = refined_boxes
                 
-                # Update boxes in instances (để đưa vào SAM prompt chuẩn hơn)
-                p_inst.proposal_boxes = refined_boxes # Update proposal thành refined box
+                # Logic Inference SAM như cũ (Hybrid Prompt)
+                rpn_boxes = p_inst.proposal_boxes.tensor
+                with torch.no_grad():
+                    box_embeddings = self.prompt_encoder(points=None, boxes=rpn_boxes, masks=None)[0]
                 
-                # Tiếp tục luồng inference SAM như cũ...
-                # (Logic SAM inference giữ nguyên, chỉ thay đổi input box là refined_boxes)
-                # ...
+                visual_embeddings = visual_emb
+                sparse_embeddings = torch.cat([box_embeddings, visual_embeddings], dim=1)
                 
-                # [ĐOẠN NÀY COPY LẠI LOGIC INFERENCE TỪ BÀI TRƯỚC VÀ DÙNG refined_boxes]
-                # ...
-                
-            # (Phần inference cậu dùng lại logic cũ, chỉ cần update p_inst.proposal_boxes là được)
-            # Để tiết kiệm token tớ không paste lại toàn bộ phần inference trừ khi cậu cần.
-            return self._postprocess(final_results, batched_inputs, images.image_sizes) 
+                with torch.no_grad():
+                    _, dense = self.prompt_encoder(points=None, boxes=None, masks=None)
+                dense = dense.repeat(sparse_embeddings.size(0), 1, 1, 1)
+
+                curr_emb = image_embeddings[i]
+                while curr_emb.dim() > 3: curr_emb = curr_emb.squeeze(0)
+                curr_emb = curr_emb.unsqueeze(0)
+                curr_pe = self.pe_layer(curr_emb)
+
+                # Batch Inference
+                chunk_size = 16
+                preds_parts = []
+                num_props = sparse_embeddings.size(0)
+                for st in range(0, num_props, chunk_size):
+                    en = min(st + chunk_size, num_props)
+                    s_chunk = sparse_embeddings[st:en]
+                    d_chunk = dense[st:en]
+                    masks_chunk, _ = self.mask_decoder(curr_emb, curr_pe, s_chunk, d_chunk, multimask_output=False)
+                    if masks_chunk.dim() == 5: masks_chunk = masks_chunk.squeeze(2)
+                    mask_pred_chunk = F.interpolate(masks_chunk, (1024, 1024), mode="bilinear", align_corners=False).squeeze(1)
+                    mask_pred_chunk = (mask_pred_chunk > 0.0) 
+                    preds_parts.append(mask_pred_chunk)
+
+                if len(preds_parts) > 0:
+                    mask_pred = torch.cat(preds_parts, dim=0)
+                else:
+                    mask_pred = torch.zeros((0, 1024, 1024), dtype=torch.bool, device=self.device)
+
+                # Filtering
+                final_instances = p_inst[valid_mask]
+                if len(final_instances) > 0:
+                    final_instances.pred_masks = mask_pred[valid_mask].unsqueeze(1)
+                    final_instances.pred_classes = classes[valid_mask]
+                    final_instances.scores = scores[valid_mask]
+                    final_instances.pred_boxes = final_instances.proposal_boxes
+                    if final_instances.has("proposal_boxes"): final_instances.remove("proposal_boxes")
+                else:
+                    final_instances.pred_masks = torch.zeros((0, 1, 1024, 1024), dtype=torch.bool, device=self.device)
+                    final_instances.pred_classes = torch.tensor([], dtype=torch.long, device=self.device)
+                    final_instances.scores = torch.tensor([], device=self.device)
+                    final_instances.pred_boxes = Boxes(torch.tensor([], device=self.device))
+
+                final_results.append(final_instances)
+
+            return self._postprocess(final_results, batched_inputs, images.image_sizes)
